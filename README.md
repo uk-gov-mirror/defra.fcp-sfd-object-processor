@@ -17,25 +17,50 @@ The object processor is a REST API and messaging gateway that processes file upl
 
 ```mermaid
 sequenceDiagram
+    participant C as Client
     participant U as CDP Uploader
     participant API as Object Processor API
     participant DB as MongoDB
-    participant BG as Background Processor
+    participant BG as Outbox Processor
     participant SNS as AWS SNS
     participant CRM as CRM Service
 
+    C->>API: POST /api/v1/uploader/initiate
+    API->>U: Initiate upload (server-side S3 and callback config)
+    API->>DB: Insert session (uploadId + metadata)
+    API-->>C: uploadId, uploadUrl, statusUrl
+    C->>U: POST file to uploadUrl
+    Note over U: Virus scan, then upload to S3
     U->>API: POST /api/v1/callback (file metadata)
-    API->>DB: Transaction: insert metadata + outbox entry
+    API->>DB: Transaction: insert metadata + outbox entries
     DB-->>API: Acknowledged
-    API-->>U: 200 OK
-    loop Every polling interval
-        BG->>DB: Poll outbox (PENDING, batch of 10)
-        DB-->>BG: Outbox entries
-        BG->>SNS: Publish CloudEvents batch
-        SNS-->>BG: Acknowledged
-        BG->>DB: Update outbox status → SENT
+    API-->>U: 201 Created
+    API->>SNS: Audit event (document/created)
+    loop Every 30s (outboxIntervalMs)
+        BG->>DB: Claim entries (PENDING, or PROCESSING with expired lease)
+        DB-->>BG: Claimed entries, status → PROCESSING
+        BG->>SNS: Publish CloudEvents (batches of 10)
+        SNS-->>BG: Per-entry results
+        BG->>DB: SENT, or retry as PENDING / PERMANENT_FAILURE
     end
-    SNS->>CRM: Deliver event
+    SNS->>CRM: Deliver uk.gov.fcp.sfd.document.uploaded
+    CRM->>API: GET /api/v1/blob/{fileId} for a presigned URL
+```
+
+### Outbox entry lifecycle
+
+An entry is claimed under a time-bound lease, so a worker that dies mid-publish does not strand its entries. Once `attempts` reaches `OUTBOX_MAX_ATTEMPTS` a failure becomes terminal rather than retrying indefinitely.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: callback persists entry
+    PENDING --> PROCESSING: claimed, attempts incremented
+    PROCESSING --> SENT: published to SNS
+    PROCESSING --> PENDING: publish failed, attempts < max
+    PROCESSING --> PERMANENT_FAILURE: publish failed, attempts >= max
+    PROCESSING --> PROCESSING: lease expired, reclaimed by another worker
+    SENT --> [*]
+    PERMANENT_FAILURE --> [*]: audit event, terminal failure logged
 ```
 
 ### Layered Architecture
@@ -45,7 +70,16 @@ src/api/          → Routes, handlers, Joi validation schemas
 src/services/     → Business logic, transaction management, orchestrates repos
 src/repos/        → Database operations (accept session for transactions)
 src/data/         → MongoDB client
+src/s3/           → S3 client
+src/http/         → Outbound HTTP client with retry policy
 src/messaging/    → SNS publishing (outbound) and client (sns)
+src/plugins/      → Hapi plugins (Entra and Cognito JWT auth)
+src/config/       → Convict configuration, split by concern
+src/logging/      → Pino/ECS logger and correlation ID store
+src/mappers/      → Payload to domain shape mapping
+src/utils/        → ECS log builders and payload helpers
+src/errors/       → Domain error types
+src/constants/    → Shared enums and literals
 ```
 
 **Rules:**
@@ -55,9 +89,21 @@ src/messaging/    → SNS publishing (outbound) and client (sns)
 
 ### Why Transactional Outbox?
 
-Writing metadata and publishing to SNS in the same operation risks data loss if SNS is unavailable. The outbox pattern ensures that if data is persisted, the corresponding message will eventually be published. The background processor retries until successful.
+Writing metadata and publishing to SNS in the same operation risks data loss if SNS is unavailable. The outbox pattern ensures that if data is persisted, the corresponding message will eventually be published.
 
 MongoDB replica sets are required because the metadata insert and outbox entry creation must happen in a single atomic transaction.
+
+Delivery is retried, but not forever. An entry that exhausts `OUTBOX_MAX_ATTEMPTS` is moved to `PERMANENT_FAILURE`, which emits a failure audit event and an `outbox_terminal_failure` log line rather than blocking the queue behind it.
+
+### Outbox configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `OUTBOX_MAX_ATTEMPTS` | `3` | Delivery attempts before an entry becomes `PERMANENT_FAILURE` |
+| `OUTBOX_CLAIM_LEASE_MS` | `300000` | How long a worker's claim on an entry stays valid before another worker may reclaim it |
+| `MONGO_OUTBOX_QUERY_LIMIT` | `100` | Maximum entries claimed in a single polling run |
+
+Two further values are not settable by environment variable: the polling interval, 30 seconds (`messaging.outboxIntervalMs` in [`src/config/server.js`](src/config/server.js)), and the SNS publish batch size of 10 (`BATCH_SIZE` in [`src/constants/outbox.js`](src/constants/outbox.js)).
 
 
 ## Prerequisites
@@ -169,7 +215,9 @@ This service uses **Microsoft Entra ID (Azure AD) JWT authentication** in deploy
 
 To enable authentication locally, set `AUTH_ENTRA_ENABLED=true` or `AUTH_COGNITO_ENABLED=true` and configure relevant Auth values in your `.env` file (see [`.env.example`](.env.example) for the format).
 
-Configuration details are in [`src/config/auth.js`](src/config/auth.js) and the auth plugin is at [`src/plugins/auth.js`](src/plugins/auth.js).
+Both strategies may be enabled at once. Entra tenants are combined into a single strategy rather than one per tenant, because Entra serves identical signing keys across tenants and Hapi's multi-strategy fallback would otherwise reject a valid token before reaching the strategy that accepts it.
+
+Configuration details are in [`src/config/auth.js`](src/config/auth.js) and the auth plugin is at [`src/plugins/auth/index.js`](src/plugins/auth/index.js).
 
 ## Using the service
 
@@ -184,25 +232,43 @@ As mentioned, all API interactions available (including the possible responses) 
 View the openapi spec for example commands and full API documentation.
 
 The steps to upload a file are as follows:
-1. POST to `uploader/initiate`
-2. POST direct to cdp-uploader `upload-and-scan/{uploadId}`
-Upload is now complete check the status of the upload via: 
-3. GET `/uploader/status/{uploadId}`
+1. POST to `uploader/initiate`. The payload accepts only `redirect` and `metadata` — the S3 bucket, S3 path, callback URL, permitted MIME types and maximum file size are all server-side configuration and are rejected if sent by the client.
+2. POST the file direct to cdp-uploader at the returned `uploadUrl`.
+3. GET `/uploader/status/{uploadId}` to check the scan outcome. The raw CDP state is mapped to `pending`, `success` or `failure`.
+
+CDP Uploader calls `POST /api/v1/callback` in the background once scanning completes. That is what persists the metadata and queues the outbox entries, so a file is not retrievable through the endpoints below until the callback has landed.
 
 ### Retrieve metadata
 
-Metadata relating to a given SBI (Single Business Identifier) can be retrieved by providing the SBI in question. In this case, from the previous examples this would be `123456789`.
+Metadata relating to a given SBI (Single Business Identifier) can be retrieved by providing the SBI in question. In this case, from the previous examples this would be `105000000`.
 
-GET ` metadata/sbi/{sbi}"`
+GET `/api/v1/metadata/sbi/{sbi}`
 
 ### Accessing uploaded files
+
 Using the `/blob/{fileId}` endpoint will generate a short lived presigned url that will enable the file to be viewed/downloaded.
 
 Note: The `fileId` is returned from the `uploader/status/{uploadId}` endpoint or the `/metadata/sbi/{sbi}` endpoint.
 
-The intended flow is as follows
+### Diagnosing a rejected callback
 
+A callback that fails validation is deliberately answered with `201 Created` rather than rejected, and the reason is persisted instead. If a file was uploaded but no metadata appears, retrieve the stored outcome:
 
+GET `/api/v1/status/{correlationId}`
+
+## Audit events
+
+This service publishes audit events to the shared `fcp-audit` SNS topic via `@defra/fcp-audit-publisher`, alongside the document upload events it publishes for CRM.
+
+| Emitted from | Entity / action | Outcome |
+|---|---|---|
+| `POST /api/v1/callback` | `document` / `created` | success, one per persisted file |
+| `POST /api/v1/callback` validation or persist failure | `document` / `failed` | failure |
+| `GET /api/v1/blob/{fileId}` | `document` / `read` | success |
+| `GET /api/v1/metadata/sbi/{sbi}` | `document` / `read` | success, one per document returned |
+| Outbox entry reaching `PERMANENT_FAILURE` | `document` / `failed` | failure |
+
+Every publish is fired through `Promise.allSettled` or an explicit `catch`, so an audit transport failure can never turn a successful request into a 500 or abort an outbox polling run. The topic ARN is set with `AUDIT_TOPIC_ARN`. See [`src/messaging/outbound/audit/send-audit-event.js`](src/messaging/outbound/audit/send-audit-event.js).
 
 ## Local Infrastructure
 
@@ -256,44 +322,6 @@ This service uses [Pino](https://getpino.io/) with [Elastic Common Schema (ECS)]
 | `event.kind` | text | High-level type — use for HTTP status code |
 | `event.duration` | long | Round-trip time in **nanoseconds** (`ms × 1,000,000`) |
 | `event.severity` | long | Custom severity level (0–10) |
-
-## HTTP Retry
-
-Outbound HTTP calls (to CDP Uploader) use [`@fetchkit/ffetch`](https://github.com/fetch-kit/ffetch) with configurable retry and exponential backoff.
-
-### Error classification
-
-| Category | Triggers | Behaviour |
-|---|---|---|
-| `retryable` | 5xx responses, 429 Too Many Requests, network errors (`ECONNREFUSED`, `ETIMEDOUT`, etc.), timeout | Retried up to `HTTP_RETRY_MAX_ATTEMPTS` |
-| `nonRetryable` | 4xx responses (excluding 429), user abort | Not retried — fails immediately |
-| `unknown` | Unrecognised/unexpected errors | Retried up to `RETRY_UNKNOWN_MAX_ATTEMPTS` (conservative budget) |
-
-### Retry metadata
-
-The HTTP client preserves existing success response contracts. For terminal thrown errors (for example, timeout/network failures), the error is enriched with:
-
-- `error.retryMetadata.attempts`
-- `error.retryMetadata.category` (`retryable`, `non-retryable`, `unknown`)
-- `error.retryMetadata.terminalReason`
-
-Retry decisions, terminal failures, and retry recovery are logged from the HTTP client layer using ECS-style `event.*` fields.
-
-### Configuration
-
-| Variable | Default | Description |
-|---|---|---|
-| `HTTP_RETRY_MAX_ATTEMPTS` | `3` | Total attempts (including first) for retryable errors |
-| `HTTP_RETRY_BASE_DELAY_MS` | `500` | Initial backoff delay in milliseconds |
-| `HTTP_RETRY_BACKOFF_MULTIPLIER` | `1.5` | Multiplier applied each retry (500 → 750 → 1125 ms) |
-| `HTTP_RETRY_JITTER_PERCENTAGE` | `15` | ±% random jitter added to each delay to avoid thundering herd |
-| `HTTP_RETRY_MAX_DELAY_MS` | `15000` | Hard cap on any single retry delay |
-| `RETRY_UNKNOWN_MAX_ATTEMPTS` | `2` | Total attempts for unknown errors (1 retry) |
-| `RETRY_UNKNOWN_MAX_DELAY_MS` | `10000` | Hard cap on unknown-error retry delays |
-
-Request timeout per attempt is controlled by `CDP_UPLOADER_TIMEOUT_MS` (default `30000` ms).
-
-See [`src/config/retry.js`](src/config/retry.js) and [`src/http/client.js`](src/http/client.js) for implementation details.
 | `event.created` | date | Time the event was created |
 
 ### Approved `error.*` fields
@@ -378,6 +406,46 @@ Reusable structured log builders live in [`src/utils/`](src/utils/) and must use
 - [`build-auth-failure-log.js`](src/utils/build-auth-failure-log.js) — authentication failure context
 
 > **Rule:** Any new log builder must follow this pattern. Use correctly nested CDP fields rather than flattened keys — incorrectly structured fields are not visible on the platform.
+
+## HTTP Retry
+
+Outbound HTTP calls (to CDP Uploader) use [`@fetchkit/ffetch`](https://github.com/fetch-kit/ffetch) with configurable retry and exponential backoff.
+
+### Error classification
+
+| Category | Triggers | Behaviour |
+|---|---|---|
+| `retryable` | 5xx responses, 429 Too Many Requests, network errors (`ECONNREFUSED`, `ETIMEDOUT`, etc.), timeout | Retried up to `HTTP_RETRY_MAX_ATTEMPTS` |
+| `nonRetryable` | 4xx responses (excluding 429), user abort | Not retried, fails immediately |
+| `unknown` | Unrecognised/unexpected errors | Retried up to `RETRY_UNKNOWN_MAX_ATTEMPTS` (conservative budget) |
+
+### Retry metadata
+
+The HTTP client preserves existing success response contracts. For terminal thrown errors (for example, timeout/network failures), the error is enriched with:
+
+- `error.retryMetadata.attempts`
+- `error.retryMetadata.category` (`retryable`, `non-retryable`, `unknown`)
+- `error.retryMetadata.terminalReason`
+
+Retry decisions, terminal failures, and retry recovery are logged from the HTTP client layer using ECS-style `event.*` fields.
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `HTTP_RETRY_MAX_ATTEMPTS` | `3` | Total attempts (including first) for retryable errors |
+| `HTTP_RETRY_BASE_DELAY_MS` | `500` | Initial backoff delay in milliseconds |
+| `HTTP_RETRY_BACKOFF_MULTIPLIER` | `1.5` | Multiplier applied each retry (500 → 750 → 1125 ms) |
+| `HTTP_RETRY_JITTER_PERCENTAGE` | `15` | ±% random jitter added to each delay to avoid thundering herd |
+| `HTTP_RETRY_MAX_DELAY_MS` | `15000` | Hard cap on any single retry delay |
+| `RETRY_UNKNOWN_MAX_ATTEMPTS` | `2` | Total attempts for unknown errors (1 retry) |
+| `RETRY_UNKNOWN_MAX_DELAY_MS` | `10000` | Hard cap on unknown-error retry delays |
+
+Request timeout per attempt is controlled by `CDP_UPLOADER_TIMEOUT_MS` (default `30000` ms).
+
+This retry policy governs outbound HTTP only. Outbox delivery to SNS has its own attempt budget, described under [Outbox configuration](#outbox-configuration).
+
+See [`src/config/retry.js`](src/config/retry.js) and [`src/http/client.js`](src/http/client.js) for implementation details.
 
 ## Tests
 
@@ -493,6 +561,7 @@ pip3 install pre-commit
 |-----------|-------------|
 | [fcp-sfd-core](https://github.com/DEFRA/fcp-sfd-core) | Full-stack local development orchestration for all SFD services |
 | [cdp-uploader](https://github.com/DEFRA/cdp-uploader) | Upstream file scanning and upload service |
+| [fcp-sfd-crm](https://github.com/DEFRA/fcp-sfd-crm) | Downstream consumer of `uk.gov.fcp.sfd.document.uploaded`, creates the Dataverse case |
 
 ## Licence
 
