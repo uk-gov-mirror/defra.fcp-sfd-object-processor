@@ -266,8 +266,8 @@ describe('getPendingOutboxMetrics', () => {
     const limit = vi.fn().mockReturnValue({ project })
     const sort = vi.fn().mockReturnValue({ limit })
     const find = vi.fn().mockReturnValue({ sort })
-    const countDocuments = vi.fn().mockResolvedValue(3)
-    mocks.collection.mockReturnValue({ countDocuments, find })
+    const aggregate = vi.fn().mockReturnValue({ next: vi.fn().mockResolvedValue({ n: 3 }) })
+    mocks.collection.mockReturnValue({ aggregate, find })
 
     await expect(getPendingOutboxMetrics()).resolves.toEqual({
       count: 3,
@@ -286,7 +286,7 @@ describe('getPendingOutboxMetrics', () => {
     const sort = vi.fn().mockReturnValue({ limit })
     const find = vi.fn().mockReturnValue({ sort })
     mocks.collection.mockReturnValue({
-      countDocuments: vi.fn().mockResolvedValue(0),
+      aggregate: vi.fn().mockReturnValue({ next: vi.fn().mockResolvedValue(null) }),
       find
     })
 
