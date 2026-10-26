@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import { beforeEach, describe, expect, test, vi } from 'vitest'
 import Hapi from '@hapi/hapi'
+import { getTraceId } from '@defra/hapi-tracing'
+import { requestTracing } from '../../../../../src/api/common/helpers/request-tracing.js'
 
 const mockLoggerWarn = vi.fn()
-const mockSendAuditEvent = vi.fn().mockResolvedValue(undefined)
 
 vi.mock('../../../../../src/logging/logger.js', () => ({
   createLogger: () => ({
@@ -10,10 +11,6 @@ vi.mock('../../../../../src/logging/logger.js', () => ({
     error: vi.fn(),
     info: vi.fn()
   })
-}))
-
-vi.mock('../../../../../src/messaging/outbound/audit/send-audit-event.js', () => ({
-  sendAuditEvent: mockSendAuditEvent
 }))
 
 vi.mock('../../../../../src/config/index.js', () => ({
@@ -29,10 +26,6 @@ describe('request-id validation', () => {
     vi.clearAllMocks()
   })
 
-  afterEach(async () => {
-    // no-op: the helper does not require server lifecycle cleanup in these tests
-  })
-
   const routes = [
     {
       name: 'blob route',
@@ -46,7 +39,7 @@ describe('request-id validation', () => {
     },
     {
       name: 'unauthenticated route',
-      path: '/api/v1/health',
+      path: '/health',
       method: 'GET'
     }
   ]
@@ -54,6 +47,14 @@ describe('request-id validation', () => {
   test.each(routes)('rejects oversized request ids before $name handles the request', async ({ path, method }) => {
     const server = Hapi.server()
     server.ext('onRequest', rejectOversizedRequestId)
+    let traceId
+    let requestId
+    server.ext('onPreResponse', (request, h) => {
+      traceId = getTraceId()
+      requestId = request.headers['x-cdp-request-id']
+      return h.continue
+    })
+    await server.register(requestTracing)
     server.route({ method, path, handler: () => ({ ok: true }) })
     await server.initialize()
 
@@ -66,21 +67,20 @@ describe('request-id validation', () => {
     expect(response.statusCode).toBe(400)
     expect(response.result.message).toContain('x-cdp-request-id')
     expect(response.result.message).toContain('50')
-    expect(mockSendAuditEvent).toHaveBeenCalledTimes(1)
-
-    const auditEvent = mockSendAuditEvent.mock.calls[0][0]
-    expect(auditEvent).toHaveProperty('correlationid')
-    expect(auditEvent.correlationid).toMatch(/^[0-9a-f-]{36}$/i)
-    expect(JSON.stringify(auditEvent)).not.toContain('a'.repeat(51))
+    expect(traceId).toBeUndefined()
+    expect(requestId).toBeUndefined()
+    expect(JSON.stringify(mockLoggerWarn.mock.calls)).not.toContain('a'.repeat(51))
     expect(mockLoggerWarn).toHaveBeenCalledWith(
       expect.objectContaining({
         event: expect.objectContaining({
           type: 'request_id_too_long',
+          category: path,
+          reason: 'header_length=51',
           outcome: 'failure',
           kind: 400
         })
       }),
-      expect.any(String)
+      expect.stringContaining('x-cdp-request-id exceeds 50 characters')
     )
 
     await server.stop()
@@ -97,9 +97,8 @@ describe('request-id validation', () => {
       url: path,
       headers: { 'x-cdp-request-id': 'b'.repeat(50) }
     })
-
     expect(response.statusCode).toBe(200)
-    expect(mockSendAuditEvent).not.toHaveBeenCalled()
+    expect(mockLoggerWarn).not.toHaveBeenCalled()
 
     await server.stop()
   })
@@ -116,7 +115,7 @@ describe('request-id validation', () => {
     })
 
     expect(response.statusCode).toBe(200)
-    expect(mockSendAuditEvent).not.toHaveBeenCalled()
+    expect(mockLoggerWarn).not.toHaveBeenCalled()
 
     await server.stop()
   })

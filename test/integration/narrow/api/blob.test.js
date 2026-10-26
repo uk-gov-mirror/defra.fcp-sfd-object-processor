@@ -6,6 +6,7 @@ import { getDb, connectDb, closeDb } from '../../../../src/data/db.js'
 import { config } from '../../../../src/config'
 import { mockFormattedMetadata } from '../../../mocks/metadata.js'
 import { assertValidAuditEvent } from '../../../helpers/validate-audit-payload.js'
+import { createEntraTestServer } from '../../../helpers/create-entra-test-server.js'
 
 let db
 
@@ -19,12 +20,18 @@ afterAll(async () => {
 })
 
 const capturedAuditEvents = []
+const rejectedAuditEvents = []
 
 vi.mock('@defra/fcp-audit-publisher', async (importOriginal) => {
   const actual = await importOriginal()
   return {
     ...actual,
     publishAuditEvent: vi.fn().mockImplementation(async (event, config) => {
+      if (typeof event.correlationid === 'string' && event.correlationid.length > 50) {
+        rejectedAuditEvents.push(event)
+        throw new Error('correlationid must be 50 characters or fewer')
+      }
+
       // Simulate what @defra/fcp-audit-publisher does: add required fields
       const enrichedEvent = {
         datetime: new Date().toISOString(),
@@ -33,7 +40,8 @@ vi.mock('@defra/fcp-audit-publisher', async (importOriginal) => {
         component: config?.component,
         environment: config?.environment,
         ip: config?.ip || '0.0.0.0',
-        correlationid: event.correlationid || config?.generateCorrelationId ? crypto.randomUUID() : undefined,
+        correlationid: event.correlationid ?? (config?.generateCorrelationId ? crypto.randomUUID() : undefined),
+        security: event.security,
         audit: event.audit
       }
       capturedAuditEvents.push(enrichedEvent)
@@ -70,6 +78,111 @@ describe('GET to the /api/v1/blob/{fileId} route', () => {
   beforeAll(async () => {
     server = await createServer()
     await server.initialize()
+  })
+
+  let authServer
+  let validToken
+  let cleanupAuthServer
+
+  beforeAll(async () => {
+    const authContext = await createEntraTestServer()
+    authServer = authContext.server
+    validToken = authContext.token
+    cleanupAuthServer = authContext.cleanup
+  })
+
+  afterAll(async () => {
+    await cleanupAuthServer()
+  })
+
+  const requestIdCases = [
+    {
+      name: 'rejects oversized request id before auth and does not audit it',
+      requestId: 'a'.repeat(51),
+      authenticate: true,
+      expectedStatus: 400,
+      expectedCorrelationId: /^[0-9a-f-]{36}$/i
+    },
+    {
+      name: 'accepts maximum-length request id with a valid token',
+      requestId: 'b'.repeat(50),
+      authenticate: true,
+      expectedStatus: 200,
+      expectedCorrelationId: 'b'.repeat(50)
+    },
+    {
+      name: 'generates request id when omitted with a valid token',
+      requestId: null,
+      authenticate: true,
+      expectedStatus: 200,
+      expectedCorrelationId: /^[0-9a-f-]{36}$/i
+    },
+    {
+      name: 'rejects oversized request id before auth without a token',
+      requestId: 'c'.repeat(51),
+      authenticate: false,
+      expectedStatus: 400,
+      expectedCorrelationId: /^[0-9a-f-]{36}$/i
+    },
+    {
+      name: 'rejects maximum-length request id without a token',
+      requestId: 'd'.repeat(50),
+      authenticate: false,
+      expectedStatus: 401,
+      expectedCorrelationId: 'd'.repeat(50)
+    },
+    {
+      name: 'generates request id when omitted without a token',
+      requestId: null,
+      authenticate: false,
+      expectedStatus: 401,
+      expectedCorrelationId: /^[0-9a-f-]{36}$/i
+    }
+  ]
+
+  test.each(requestIdCases)('$name', async ({ requestId, authenticate, expectedStatus, expectedCorrelationId }) => {
+    await db.collection(collection).insertOne(mockFormattedMetadata)
+
+    const headers = {}
+    if (requestId !== null) {
+      headers['x-cdp-request-id'] = requestId
+    }
+    if (authenticate) {
+      headers.authorization = 'Bearer '.concat(validToken)
+    }
+
+    capturedAuditEvents.length = 0
+    rejectedAuditEvents.length = 0
+    const response = await authServer.inject({
+      method: 'GET',
+      url: `/api/v1/blob/${mockFormattedMetadata.file.fileId}`,
+      headers
+    })
+
+    expect(response.statusCode).toBe(expectedStatus)
+    expect(rejectedAuditEvents).toHaveLength(0)
+
+    if (expectedStatus === 200) {
+      expect(response.result.data.url).toContain(`/${mockFormattedMetadata.s3.key}`)
+    } else {
+      expect(response.result?.data).toBeUndefined()
+    }
+
+    expect(capturedAuditEvents).toHaveLength(expectedStatus === 400 ? 0 : 1)
+    if (expectedStatus === 401) {
+      expect(capturedAuditEvents[0].audit.entities[0]).toMatchObject({ entity: 'document', action: 'failed' })
+    } else if (expectedStatus === 200) {
+      expect(capturedAuditEvents[0].audit.entities[0]).toMatchObject({ entity: 'document', action: 'read' })
+    }
+
+    if (expectedStatus !== 400) {
+      const correlationId = capturedAuditEvents[0].correlationid
+      if (expectedCorrelationId instanceof RegExp) {
+        expect(correlationId).toMatch(expectedCorrelationId)
+      } else {
+        expect(correlationId).toBe(expectedCorrelationId)
+      }
+    }
   })
 
   describe('with a valid fileId', async () => {

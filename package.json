@@ -29,6 +29,7 @@
     "start": "node --experimental-vm-modules src/index.js"
   },
   "overrides": {
+    "@hapi/content": "6.0.3",
     "@defra/fcp-audit-publisher": {
       "joi": "18.2.9"
     },

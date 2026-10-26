@@ -4,6 +4,7 @@ import { mockMetadataResponse } from '../../../mocks/metadata.js'
 import { config } from '../../../../src/config/index.js'
 import { getDb, connectDb, closeDb } from '../../../../src/data/db.js'
 import { assertValidAuditEvent } from '../../../helpers/validate-audit-payload.js'
+import { createEntraTestServer } from '../../../helpers/create-entra-test-server.js'
 
 let db
 
@@ -18,12 +19,18 @@ afterAll(async () => {
 
 const PAGE_SIZE_CONFIG_KEY = 'mongo.metadataSbiPageSize'
 const capturedAuditEvents = []
+const rejectedAuditEvents = []
 
 vi.mock('@defra/fcp-audit-publisher', async (importOriginal) => {
   const actual = await importOriginal()
   return {
     ...actual,
     publishAuditEvent: vi.fn().mockImplementation(async (event, config) => {
+      if (typeof event.correlationid === 'string' && event.correlationid.length > 50) {
+        rejectedAuditEvents.push(event)
+        throw new Error('correlationid must be 50 characters or fewer')
+      }
+
       // Simulate what @defra/fcp-audit-publisher does: add required fields
       const enrichedEvent = {
         datetime: new Date().toISOString(),
@@ -32,7 +39,8 @@ vi.mock('@defra/fcp-audit-publisher', async (importOriginal) => {
         component: config?.component,
         environment: config?.environment,
         ip: config?.ip || '0.0.0.0',
-        correlationid: event.correlationid || config?.generateCorrelationId ? crypto.randomUUID() : undefined,
+        correlationid: event.correlationid ?? (config?.generateCorrelationId ? crypto.randomUUID() : undefined),
+        security: event.security,
         audit: event.audit
       }
       capturedAuditEvents.push(enrichedEvent)
@@ -69,10 +77,71 @@ afterAll(async () => {
 
 describe('GET to the /api/v1/metadata/sbi route', () => {
   const sbi = mockMetadataResponse[0].metadata.sbi
+  let authServer
+  let validToken
+  let cleanupAuthServer
 
   beforeAll(async () => {
     server = await createServer()
     await server.initialize()
+
+    const authContext = await createEntraTestServer()
+    authServer = authContext.server
+    validToken = authContext.token
+    cleanupAuthServer = authContext.cleanup
+  })
+
+  afterAll(async () => {
+    await cleanupAuthServer()
+  })
+
+  test('validates request ids on the real route before auth without auditing oversized values', async () => {
+    const payloads = [
+      { headers: { Authorization: `Bearer ${validToken}`, 'x-cdp-request-id': 'a'.repeat(51) }, expectedStatus: 400, expectedCorrelationId: /^[0-9a-f-]{36}$/i },
+      { headers: { Authorization: `Bearer ${validToken}`, 'x-cdp-request-id': 'b'.repeat(50) }, expectedStatus: 200, expectedCorrelationId: 'b'.repeat(50) },
+      { headers: { Authorization: `Bearer ${validToken}` }, expectedStatus: 200, expectedCorrelationId: /^[0-9a-f-]{36}$/i },
+      { headers: { 'x-cdp-request-id': 'c'.repeat(51) }, expectedStatus: 400, expectedCorrelationId: /^[0-9a-f-]{36}$/i },
+      { headers: { 'x-cdp-request-id': 'd'.repeat(50) }, expectedStatus: 401, expectedCorrelationId: 'd'.repeat(50) },
+      { headers: {}, expectedStatus: 401, expectedCorrelationId: /^[0-9a-f-]{36}$/i }
+    ]
+
+    await db.collection(collection).insertMany(mockMetadataResponse)
+
+    for (const { headers, expectedStatus, expectedCorrelationId } of payloads) {
+      capturedAuditEvents.length = 0
+      rejectedAuditEvents.length = 0
+      const response = await authServer.inject({
+        method: 'GET',
+        url: `/api/v1/metadata/sbi/${sbi}`,
+        headers
+      })
+
+      expect(response.statusCode).toBe(expectedStatus)
+      expect(rejectedAuditEvents).toHaveLength(0)
+
+      if (expectedStatus === 200) {
+        expect(response.result.data).toHaveLength(2)
+        expect(response.result.page).toMatchObject({ count: 2 })
+      } else {
+        expect(response.result?.data).toBeUndefined()
+      }
+
+      expect(capturedAuditEvents).toHaveLength(expectedStatus === 400 ? 0 : 1)
+      if (expectedStatus === 401) {
+        expect(capturedAuditEvents[0].audit.entities[0]).toMatchObject({ entity: 'request', action: 'failed' })
+      } else if (expectedStatus === 200) {
+        expect(capturedAuditEvents[0].audit.entities[0]).toMatchObject({ entity: 'document', action: 'read' })
+      }
+
+      if (expectedStatus !== 400) {
+        const correlationId = capturedAuditEvents[0].correlationid
+        if (expectedCorrelationId instanceof RegExp) {
+          expect(correlationId).toMatch(expectedCorrelationId)
+        } else {
+          expect(correlationId).toBe(expectedCorrelationId)
+        }
+      }
+    }
   })
 
   describe('when there is valid data in the database', async () => {

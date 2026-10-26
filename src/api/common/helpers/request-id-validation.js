@@ -1,44 +1,12 @@
-import { randomUUID } from 'node:crypto'
-import { constants as httpConstants } from 'node:http2'
+import Boom from '@hapi/boom'
 
 import { config } from '../../../config/index.js'
 import { createLogger } from '../../../logging/logger.js'
-import { sendAuditEvent } from '../../../messaging/outbound/audit/send-audit-event.js'
+import { buildOversizedRequestIdLog } from '../../../utils/build-oversized-request-id-log.js'
 
 const logger = createLogger()
 const tracingHeader = config.get('tracing.header')
-const MAX_REQUEST_ID_LENGTH = 50
-
-const buildOversizedRequestIdLog = (request, headerLength) => ({
-  event: {
-    type: 'request_id_too_long',
-    action: request.method,
-    category: request.path,
-    reason: `header_length=${headerLength}`,
-    outcome: 'failure',
-    kind: httpConstants.HTTP_STATUS_BAD_REQUEST
-  }
-})
-
-const buildOversizedRequestIdAuditEvent = (request) => {
-  const correlationId = randomUUID()
-
-  return {
-    correlationid: correlationId,
-    security: {
-      pmccode: 'AUTH',
-      priority: 1,
-      details: {
-        message: 'x-cdp-request-id header exceeds 50 characters'
-      }
-    },
-    audit: {
-      entities: [{ entity: 'request', action: 'failed', entityid: correlationId }],
-      status: 'failure',
-      details: { path: request.path, method: request.method }
-    }
-  }
-}
+const MAX_REQUEST_ID_LENGTH = 50 // fcp-audit-publisher Sets the max length for correlationid using Joi.string().max(50)
 
 export const rejectOversizedRequestId = (request, h) => {
   const requestId = request.headers?.[tracingHeader]
@@ -48,18 +16,15 @@ export const rejectOversizedRequestId = (request, h) => {
   }
 
   const headerLength = requestId.length
+  // Hides the oversized id from later onRequest extensions.
+  delete request.headers[tracingHeader]
+
   logger.warn(
     buildOversizedRequestIdLog(request, headerLength),
-    'Request rejected because x-cdp-request-id exceeds 50 characters'
+    `Request rejected because ${tracingHeader} exceeds ${MAX_REQUEST_ID_LENGTH} characters`
   )
 
-  sendAuditEvent(buildOversizedRequestIdAuditEvent(request), request).catch((err) => {
-    logger.warn({ msg: 'Failed to send oversized request id audit event', err })
-  })
-
-  return h.response({
-    message: 'x-cdp-request-id header must be 50 characters or fewer'
-  }).code(httpConstants.HTTP_STATUS_BAD_REQUEST).takeover()
+  throw Boom.badRequest(`${tracingHeader} header must be ${MAX_REQUEST_ID_LENGTH} characters or fewer`)
 }
 
 const requestIdValidation = {
